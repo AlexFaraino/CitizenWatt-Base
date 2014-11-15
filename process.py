@@ -5,7 +5,6 @@ This script receives incoming AES encrypted measures from `receive` via
 a named pipe and do the necessary to store them in database.
 """
 
-
 import datetime
 import json
 import os
