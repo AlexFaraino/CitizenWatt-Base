@@ -5,7 +5,7 @@ import json
 import os
 import requests
 import subprocess
-import sys
+import re
 
 
 from libcitizenwatt import cache
@@ -16,87 +16,9 @@ from bottle import redirect, request, run
 from bottle.ext import sqlalchemy
 from bottlesession import PickleSession, authenticator
 from libcitizenwatt.config import Config
-from sqlalchemy import create_engine, desc
-from sqlalchemy.exc import OperationalError, ProgrammingError
-
-
-# =========
-# Functions
-# =========
-def get_rate_type(db):
-    """Returns "day" or "night" according to current time"""
-    session = session_manager.get_session()
-    user = db.query(database.User).filter_by(login=session.get("login")).first()
-    now = datetime.datetime.now()
-    now = 3600 * now.hour + 60 * now.minute
-    if user is None:
-        return None
-    elif user.end_night_rate > user.start_night_rate:
-        if now > user.start_night_rate and now < user.end_night_rate:
-            return "night"
-        else:
-            return "day"
-    else:
-        if now > user.start_night_rate or now < user.end_night_rate:
-            return "night"
-        else:
-            return "day"
-
-
-def update_providers(fetch, db):
-    """Updates the available providers. Simply returns them without updating if
-    fetch is False.
-    """
-    try:
-        assert(fetch)
-        providers = requests.get(config.get("url_energy_providers")).json()
-    except (requests.ConnectionError, AssertionError):
-        providers = db.query(database.Provider).all()
-        if not providers:
-            providers = []
-        return tools.to_dict(providers)
-
-    old_current = db.query(database.Provider).filter_by(current=1).first()
-    db.query(database.Provider).delete()
-
-    for provider in providers:
-        type_id = (db.query(database.MeasureType)
-                   .filter_by(name=provider["type_name"])
-                   .first())
-        if not type_id:
-            type_db = database.MeasureType(name=provider["type_name"])
-            db.add(type_db)
-            db.flush()
-            type_id = database.MeasureType(name=provider["type_name"]).first()
-
-        provider_db = database.Provider(name=provider["name"],
-                                        day_constant_watt_euros=provider["day_constant_watt_euros"],
-                                        day_slope_watt_euros=provider["day_slope_watt_euros"],
-                                        night_constant_watt_euros=provider["night_constant_watt_euros"],
-                                        night_slope_watt_euros=provider["night_slope_watt_euros"],
-                                        type_id=type_id.id,
-                                        current=(1 if old_current and old_current.name == provider["name"] else 0),
-                                        threshold=int(provider["threshold"]))
-        db.add(provider_db)
-    return providers
-
-
-def api_auth(post, db):
-    """
-    Handles login authentication for API.
-
-    Returns True if login is ok, False otherwise.
-    """
-    login = post.get("login")
-    user = db.query(database.User).filter_by(login=login).first()
-
-    password = (config.get("salt") +
-                hashlib.sha256(post.get("password", "").encode('utf-8'))
-                .hexdigest())
-    if user and user.password == password:
-        return True
-    else:
-        return False
+from sqlalchemy import asc, create_engine, desc
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from xmlrpc.client import ServerProxy
 
 
 # ===============
@@ -123,9 +45,55 @@ session_manager = PickleSession()
 valid_user = authenticator(session_manager, login_url='/login')
 
 
+# =========
+# Functions
+# =========
+def get_rate_type(db):
+    """Returns "day" or "night" according to current time"""
+    if not tools.is_day_night_rate(db):
+        return "none"
+    session = session_manager.get_session()
+    user = db.query(database.User).filter_by(login=session.get("login")).first()
+    now = datetime.datetime.now()
+    now = 3600 * now.hour + 60 * now.minute
+    if user is None:
+        return None
+    elif user.end_night_rate > user.start_night_rate:
+        if now > user.start_night_rate and now < user.end_night_rate:
+            return "night"
+        else:
+            return "day"
+    else:
+        if now > user.start_night_rate or now < user.end_night_rate:
+            return "night"
+        else:
+            return "day"
+
+
+def api_auth(post, db):
+    """
+    Handles login authentication for API.
+
+    Returns True if login is ok, False otherwise.
+    """
+    login = post.get("login")
+    user = db.query(database.User).filter_by(login=login).first()
+
+    password = (config.get("salt") +
+                hashlib.sha256(post.get("password", "").encode('utf-8'))
+                .hexdigest())
+    if user and user.password == password:
+        return True
+    else:
+        return False
+
+
 # ===
 # API
 # ===
+
+# Sensors management
+# ==================
 @app.route("/api/sensors",
            apply=valid_user())
 def api_sensors(db):
@@ -147,6 +115,7 @@ def api_sensors(db):
 @app.route("/api/sensors",
            method="post")
 def api_sensors_post(db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_sensors(db)
     else:
@@ -174,12 +143,15 @@ def api_sensor(id, db):
 @app.route("/api/sensors/<id:int>",
            method="post")
 def api_sensor_post(id, db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_sensor(id, db)
     else:
         abort(403, "Access forbidden")
 
 
+# Measure types
+# =============
 @app.route("/api/types",
            apply=valid_user())
 def api_types(db):
@@ -199,12 +171,15 @@ def api_types(db):
 @app.route("/api/types",
            method="post")
 def api_types_post(db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_types(db)
     else:
         abort(403, "Access forbidden")
 
 
+# Time
+# ====
 @app.route("/api/time",
            apply=valid_user())
 def api_time(db):
@@ -218,12 +193,15 @@ def api_time(db):
 @app.route("/api/time",
            method="post")
 def api_time_post(db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_time(db)
     else:
         abort(403, "Access forbidden")
 
 
+# Get measures
+# ============
 @app.route("/api/<sensor:int>/get/watts/by_id/<id1:int>",
            apply=valid_user())
 def api_get_id(sensor, id1, db):
@@ -235,13 +213,13 @@ def api_get_id(sensor, id1, db):
     If no matching data is found, returns null.
     """
     if id1 >= 0:
-        data = (db.query(database.Measures)
+        data = (db.query(database.Measure)
                 .filter_by(sensor_id=sensor, id=id1)
                 .first())
     else:
-        data = (db.query(database.Measures)
+        data = (db.query(database.Measure)
                 .filter_by(sensor_id=sensor)
-                .order_by(desc(database.Measures.timestamp))
+                .order_by(desc(database.Measure.timestamp))
                 .slice(-id1, -id1)
                 .first())
 
@@ -256,47 +234,9 @@ def api_get_id(sensor, id1, db):
 @app.route("/api/<sensor:int>/get/watts/by_id/<id1:int>",
            method="post")
 def api_get_id_post(sensor, id1, db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_get_id(sensor, id1, db)
-    else:
-        abort(403, "Access forbidden")
-
-
-@app.route("/api/<sensor:int>/get/<watt_euros:re:watts|kwatthours|euros>/by_id/<id1:int>/<id2:int>",
-           apply=valid_user())
-def api_get_ids(sensor, watt_euros, id1, id2, db):
-    """
-    Returns measures between ids <id1> and <id2> from sensor <sensor> in
-    watts or euros.
-
-    If id1 and id2 are negative, counts from the end of the measures.
-
-    * If `watts_euros` is watts, returns the list of measures.
-    * If `watt_euros` is kwatthours, returns the total energy for all the
-    measures (dict).
-    * If `watt_euros` is euros, returns the cost of all the measures (dict).
-
-    Returns measure in ASC order of timestamp.
-
-    Returns null if no measures were found.
-    """
-    if (id2 - id1) > config.get("max_returned_values"):
-        abort(403,
-              "Too many values to return. " +
-              "(Maximum is set to %d)" % config.get("max_returned_values"))
-    elif id2 < id1 or id2 * id1 < 0:
-        abort(400, "Invalid parameters")
-    else:
-        data = cache.do_cache_ids(sensor, watt_euros, id1, id2, db)
-
-    return {"data": data, "rate": get_rate_type(db)}
-
-
-@app.route("/api/<sensor:int>/get/<watt_euros:re:watts|kwatthours|euros>/by_id/<id1:int>/<id2:int>",
-           method="post")
-def api_get_ids_post(sensor, watt_euros, id1, id2, db):
-    if api_auth(request.POST, db):
-        return api_get_ids(sensor, watt_euros, id1, id2, db)
     else:
         abort(403, "Access forbidden")
 
@@ -343,6 +283,7 @@ def api_get_ids_step(sensor, watt_euros, id1, id2, step, db,
            method="post")
 def api_get_ids_step_post(sensor, watt_euros, id1, id2, step, db,
                           timestep=config.get("default_timestep")):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_get_ids_step(sensor, watt_euros, id1, id2, step, db, timestep)
     else:
@@ -360,7 +301,7 @@ def api_get_time(sensor, time1, db):
     if time1 < 0:
         abort(400, "Invalid timestamp.")
 
-    data = (db.query(database.Measures)
+    data = (db.query(database.Measure)
             .filter_by(sensor_id=sensor,
                        timestamp=time1)
             .first())
@@ -375,6 +316,7 @@ def api_get_time(sensor, time1, db):
 @app.route("/api/<sensor:int>/get/watts/by_time/<time1:float>",
            method="post")
 def api_get_time_post(sensor, time1, db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_get_time(sensor, time1, db)
     else:
@@ -408,6 +350,7 @@ def api_get_times(sensor, watt_euros, time1, time2, db):
 @app.route("/api/<sensor:int>/get/<watt_euros:re:watts|kwatthours|euros>/by_time/<time1:float>/<time2:float>",
            method="post")
 def api_get_times_post(sensor, watt_euros, time1, time2, db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_get_times(sensor, watt_euros, time1, time2, db)
     else:
@@ -444,12 +387,222 @@ def api_get_times_step(sensor, watt_euros, time1, time2, step, db):
 @app.route("/api/<sensor:int>/get/<watt_euros:re:watts|kwatthours|euros>/by_time/<time1:float>/<time2:float>/<step:float>",
            method="post")
 def api_get_times_step_post(sensor, watt_euros, time1, time2, step, db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_get_times_step(sensor, watt_euros, time1, time2, step, db)
     else:
         abort(403, "Access forbidden")
 
 
+# Delete measures
+# ===============
+@app.route("/api/<sensor:int>/delete/by_id/<id1:int>",
+           apply=valid_user())
+def api_delete_id(sensor, id1, db):
+    """
+    Deletes measure with id <id1> associated to sensor <sensor>.
+
+    If <id1> < 0, counts from the last measure, as in Python lists.
+
+    If no matching data is found, returns null. Else, returns the number of
+    deleted measures (1).
+    """
+    if id1 >= 0:
+        data = (db.query(database.Measure)
+                .filter_by(sensor_id=sensor, id=id1)
+                .delete())
+    else:
+        data = (db.query(database.Measure)
+                .filter_by(sensor_id=sensor)
+                .order_by(desc(database.Measure.timestamp))
+                .slice(-id1, -id1)
+                .first())
+        data = db.delete(data)
+
+    if data == 0:
+        data = None
+
+    return {"data": data, "rate": get_rate_type(db)}
+
+
+@app.route("/api/<sensor:int>/delete/by_id/<id1:int>",
+           method="post")
+def api_delete_id_post(sensor, id1, db):
+    """Same as above, but with POST auth"""
+    if api_auth(request.POST, db):
+        return api_delete_id(sensor, id1, db)
+    else:
+        abort(403, "Access forbidden")
+
+
+@app.route("/api/<sensor:int>/delete/by_id/<id1:int>/<id2:int>",
+           apply=valid_user())
+def api_delete_ids(sensor, id1, id2, db):
+    """
+    Deletes measures between ids <id1> and <id2>
+    from sensor <sensor>.
+
+    Returns null if no matching measures are found. Else, returns the number of
+    deleted measures.
+    """
+    if id2 < id1 or id2 * id1 < 0:
+        abort(400, "Invalid parameters")
+    else:
+        if id1 >= 0 and id2 >= 0 and id2 >= id1:
+            data = (db.query(database.Measure)
+                    .filter(database.Measure.sensor_id == sensor,
+                            database.Measure.id >= id1,
+                            database.Measure.id < id2)
+                    .delete())
+        elif id1 <= 0 and id2 <= 0 and id2 >= id1:
+            to_delete = (db.query(database.Measure)
+                         .filter_by(sensor_id=sensor)
+                         .order_by(desc(database.Measure.timestamp))
+                         .slice(-id2, -id1)
+                         .all())
+            if to_delete:
+                data = len(to_delete)
+                for delete in to_delete:
+                    db.delete(delete)
+            else:
+                data = 0
+
+    if data == 0:
+        data = None
+
+    return {"data": data, "rate": get_rate_type(db)}
+
+
+@app.route("/api/<sensor:int>/delete/by_id/<id1:int>/<id2:int>",
+           method="post")
+def api_delete_ids_post(sensor, id1, id2, db):
+    """Same as above, but with POST auth"""
+    if api_auth(request.POST, db):
+        return api_delete_ids(sensor, id1, id2, db)
+    else:
+        abort(403, "Access forbidden")
+
+
+@app.route("/api/<sensor:int>/delete/by_time/<time1:float>",
+           apply=valid_user())
+def api_delete_time(sensor, time1, db):
+    """
+    Deletes measure at timestamp <time1> for sensor <sensor>.
+
+    Returns null if no measure is found. Else, returns the number of deleted
+    measures (1).
+    """
+    if time1 < 0:
+        abort(400, "Invalid timestamp.")
+
+    data = (db.query(database.Measure)
+            .filter_by(sensor_id=sensor,
+                       timestamp=time1)
+            .delete())
+    if data == 0:
+        data = None
+
+    return {"data": data, "rate": get_rate_type(db)}
+
+
+@app.route("/api/<sensor:int>/delete/by_time/<time1:float>",
+           method="post")
+def api_delete_time_post(sensor, time1, db):
+    """Same as above, but with POST auth"""
+    if api_auth(request.POST, db):
+        return api_delete_time(sensor, time1, db)
+    else:
+        abort(403, "Access forbidden")
+
+
+@app.route("/api/<sensor:int>/delete/by_time/<time1:float>/<time2:float>",
+           apply=valid_user())
+def api_delete_times(sensor, time1, time2, db):
+    """
+    Deletes measures between timestamps <time1> and <time2>
+    from sensor <sensor>.
+
+    Returns null if no matching measures are found. Else, returns the number of
+    deleted measures.
+    """
+    if time1 < 0 or time2 < time1:
+        abort(400, "Invalid timestamps.")
+
+    to_delete = (db.query(database.Measure)
+                 .filter(database.Measure.sensor_id == sensor,
+                         database.Measure.timestamp >= time1,
+                         database.Measure.timestamp < time2)
+                 .order_by(asc(database.Measure.timestamp))
+                 .all())
+    if to_delete:
+        data = len(to_delete)
+        for delete in to_delete:
+            db.delete(delete)
+    else:
+        data = 0
+
+    if data == 0:
+        data = None
+
+    return {"data": data, "rate": get_rate_type(db)}
+
+
+@app.route("/api/<sensor:int>/delete/by_time/<time1:float>/<time2:float>",
+           method="post")
+def api_delete_times_post(sensor, time1, time2, db):
+    """Same as above, but with POST auth"""
+    if api_auth(request.POST, db):
+        return api_delete_times(sensor, time1, time2, db)
+    else:
+        abort(403, "Access forbidden")
+
+
+# Insert measures
+# ===============
+@app.route("/api/<sensor:int>/insert/<value:float>/<timestamp:int>/<night_rate:int>",
+           apply=valid_user())
+def api_insert_measure(sensor, value, timestamp, night_rate, db):
+    """
+    Insert a measure with:
+        * Timestamp `<timestamp>`
+        * Value `<value>`
+        * Tariff "day" if `<night_rate> == 0`, "night" otherwise.
+
+    Returns `True` if successful. `False` otherwise.
+    """
+    if timestamp < 0:
+        abort(400, "Invalid timestamp.")
+
+    if night_rate != 0:
+        night_rate = 1
+
+    measure = database.Measure(value=value,
+                               timestamp=timestamp,
+                               night_rate=night_rate,
+                               sensor_id=sensor)
+    db.add(measure)
+    try:
+        db.commit()
+        data = True
+    except IntegrityError:
+        data = False
+        db.rollback()
+
+    return {"data": data, "rate": get_rate_type(db)}
+
+
+@app.route("/api/<sensor:int>/insert/<value:float>/<timestamp:int>/<night_rate:int>",
+           method="post")
+def api_insert_measure_post(sensor, value, timestamp, night_rate, db):
+    """Same as above, but with POST auth"""
+    if api_auth(request.POST, db):
+        return api_insert_measure(sensor, value, timestamp, night_rate, db)
+    else:
+        abort(403, "Access forbidden")
+
+
+# Energy providers
+# ================
 @app.route("/api/energy_providers",
            apply=valid_user())
 def api_energy_providers(db):
@@ -476,6 +629,7 @@ def api_energy_providers(db):
 @app.route("/api/energy_providers",
            method="post")
 def api_energy_providers_post(db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_energy_providers(db)
     else:
@@ -523,6 +677,7 @@ def api_specific_energy_providers(id, db):
 @app.route("/api/energy_providers/<id:re:current|\d*>",
            method="post")
 def api_specific_energy_providers_post(id, db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_specific_energy_providers(id, db)
     else:
@@ -557,6 +712,7 @@ def api_watt_euros(energy_provider, tariff, consumption, db):
 @app.route("/api/<energy_provider:re:current|\d>/watt_to_euros/<tariff:re:night|day>/<consumption:float>",
            method="post")
 def api_watt_euros_post(energy_provider, tariff, consumption, db):
+    """Same as above, but with POST auth"""
     if api_auth(request.POST, db):
         return api_watt_euros(energy_provider, tariff, consumption, db)
     else:
@@ -594,7 +750,15 @@ def conso(db):
 
 @app.route("/reset_timer/<sensor:int>", apply=valid_user())
 def reset_timer(sensor, db):
+    """Reset the timer for specified sensor"""
     db.query(database.Sensor).filter_by(id=sensor).update({"last_timer": 0})
+    redirect("/settings")
+
+
+@app.route("/toggle_ssh", apply=valid_user())
+def toggle_ssh(state, db):
+    """Enable or disable SSH service"""
+    tools.toggle_ssh()
     redirect("/settings")
 
 
@@ -611,7 +775,7 @@ def settings(db):
                     "type": sensor.type.name,
                     "type_id": sensor.type_id,
                     "aes_key": sensor.aes_key,
-                    "base_address": sensor.base_address}
+                    "base_address": hex(int(tools.get_base_address())).upper() + "LL"}
                    for sensor in sensors]
     else:
         sensors = []
@@ -619,7 +783,9 @@ def settings(db):
     sensor_cw = [sensor for sensor in sensors if sensor["name"] ==
                  "CitizenWatt"][0]
 
-    providers = update_providers(True, db)
+    providers = tools.update_providers(config.get("url_energy_providers"),
+                                       True,
+                                       db)
 
     session = session_manager.get_session()
     user = db.query(database.User).filter_by(login=session["login"]).first()
@@ -628,17 +794,23 @@ def settings(db):
     end_night_rate = ("%02d" % (user.end_night_rate // 3600) + ":" +
                       "%02d" % ((user.end_night_rate % 3600) // 60))
 
+    for p in providers:
+        p['is_day_night_rate'] = tools.is_day_night_rate(db, p)
+
     return {"sensors": sensors,
             "providers": providers,
             "start_night_rate": start_night_rate,
             "end_night_rate": end_night_rate,
-            "base_address": sensor_cw["base_address"],
+            "base_address": hex(int(tools.get_base_address())).upper() + "LL",
             "aes_key": '-'.join([str(i) for i in
-                                 json.loads(sensor_cw["aes_key"])])}
+                                 json.loads(sensor_cw["aes_key"])]),
+            "nrf_power": tools.get_nrf_power(),
+            "ssh_status": tools.ssh_status()}
 
 
 @app.route("/settings",
            name="settings",
+           template="settings",
            apply=valid_user(),
            method="post")
 def settings_post(db):
@@ -665,16 +837,28 @@ def settings_post(db):
             settings_json.update({"err": error})
             return settings_json
 
-    provider = request.forms.get("provider")
+    raw_provider = request.forms.get("provider")
     provider = (db.query(database.Provider)
-                .filter_by(name=provider)
-                .update({"current": 1}))
+                .filter_by(name=raw_provider)
+                .first())
+    if not provider:
+        error = {"title": "Fournisseur d'électricité invalide.",
+                 "content": "Le fournisseur choisi n'existe pas."}
+        settings_json = settings(db)
+        settings_json.update({"err": error})
+        return settings_json
+    db.query(database.Provider).update({"current": 0})
+    (db.query(database.Provider)
+     .filter_by(name=raw_provider)
+     .update({"current": 1}))
 
     raw_start_night_rate = request.forms.get("start_night_rate")
     raw_end_night_rate = request.forms.get("end_night_rate")
 
     raw_base_address = request.forms.get("base_address")
     raw_aes_key = request.forms.get("aes_key")
+
+    raw_nrf_power = request.forms.get("nrf_power")
 
     try:
         base_address_int = int(raw_base_address.strip("L"), 16)
@@ -686,8 +870,7 @@ def settings_post(db):
         settings_json.update({"err": error})
         return settings_json
 
-    sensor = db.query(database.Sensor).filter_by(name="CitizenWatt").first()
-    if base_address != sensor.base_address:
+    if base_address != tools.get_base_address():
         tools.update_base_address(base_address_int)
 
     try:
@@ -702,18 +885,35 @@ def settings_post(db):
         settings_json = settings(db)
         settings_json.update({"err": error})
         return settings_json
+
+    try:
+        assert(raw_nrf_power in tools.nrf_power_dict)
+    except AssertionError:
+        error = {"title": "Format invalide",
+                 "content": ("Les deux mots de passe doient " +
+                             "être identiques.")}
+        settings_json = settings(db)
+        settings_json.update({"err": error})
+        return settings_json
+
+    if raw_nrf_power != tools.get_nrf_power():
+        tools.update_nrf_power(raw_nrf_power)
+
     (db.query(database.Sensor)
      .filter_by(name="CitizenWatt")
-     .update({"base_address": base_address, "aes_key": json.dumps(aes_key)}))
+     .update({"aes_key": json.dumps(aes_key)}))
     db.commit()
 
     try:
-        start_night_rate = raw_start_night_rate.split(":")
-        assert(len(start_night_rate) == 2)
-        start_night_rate = [int(i) for i in start_night_rate]
-        assert(start_night_rate[0] >= 0 and start_night_rate[0] <= 23)
-        assert(start_night_rate[1] >= 0 and start_night_rate[1] <= 59)
-        start_night_rate = 3600 * start_night_rate[0] + 60*start_night_rate[1]
+        if tools.is_day_night_rate(db, provider):
+            start_night_rate = 0
+        else:
+            start_night_rate = raw_start_night_rate.split(":")
+            assert(len(start_night_rate) == 2)
+            start_night_rate = [int(i) for i in start_night_rate]
+            assert(start_night_rate[0] >= 0 and start_night_rate[0] <= 23)
+            assert(start_night_rate[1] >= 0 and start_night_rate[1] <= 59)
+            start_night_rate = 3600 * start_night_rate[0] + 60*start_night_rate[1]
     except (AssertionError, ValueError):
         error = {"title": "Format invalide",
                  "content": ("La date de début d'heures " +
@@ -722,12 +922,15 @@ def settings_post(db):
         settings_json.update({"err": error})
         return settings_json
     try:
-        end_night_rate = raw_end_night_rate.split(":")
-        assert(len(end_night_rate) == 2)
-        end_night_rate = [int(i) for i in end_night_rate]
-        assert(end_night_rate[0] >= 0 and end_night_rate[0] <= 23)
-        assert(end_night_rate[1] >= 0 and end_night_rate[1] <= 59)
-        end_night_rate = 3600 * end_night_rate[0] + 60*end_night_rate[1]
+        if tools.is_day_night_rate(db, provider):
+            end_night_rate = 0
+        else:
+            end_night_rate = raw_end_night_rate.split(":")
+            assert(len(end_night_rate) == 2)
+            end_night_rate = [int(i) for i in end_night_rate]
+            assert(end_night_rate[0] >= 0 and end_night_rate[0] <= 23)
+            assert(end_night_rate[1] >= 0 and end_night_rate[1] <= 59)
+            end_night_rate = 3600 * end_night_rate[0] + 60*end_night_rate[1]
     except (AssertionError, ValueError):
         error = {"title": "Format invalide",
                  "content": ("La date de fin d'heures " +
@@ -767,6 +970,22 @@ def store():
 def help():
     """Help view"""
     return {}
+
+
+@app.route("/faq",
+           name="faq",
+           template="faq")
+def faq():
+    """Show the FAQ from the wiki"""
+    try:
+        wiki = ServerProxy('http://wiki.citizenwatt.paris/lib/exe/xmlrpc.php')
+        text = wiki.wiki.getPage('les_questions_que_vous_vous_posez_tous')
+        parsed = re.split('====== (.*) ======', text)
+        l = [c.strip() for c in parsed if c.strip() != '']
+        faq = list(zip(l[::2], l[1::2]))
+    except requests.exceptions.RequestException:
+        faq = []
+    return {"faq": faq}
 
 
 @app.route("/login",
@@ -846,7 +1065,12 @@ def install(db):
     db.add(electricity_type)
     db.flush()
 
-    providers = update_providers(True, db)
+    providers = tools.update_providers(config.get("url_energy_providers"),
+                                       True,
+                                       db)
+
+    for p in providers:
+        p['is_day_night_rate'] = tools.is_day_night_rate(db, p)
 
     sensor = database.Sensor(name="CitizenWatt",
                              type_id=electricity_type.id,
@@ -858,7 +1082,8 @@ def install(db):
             "start_night_rate": '',
             "end_night_rate": '',
             "base_address": '',
-            "aes_key": ''}
+            "aes_key": '',
+            "nrf_power": 'high'}
 
 
 @app.route("/install",
@@ -882,22 +1107,25 @@ def install_post(db):
     login = request.forms.get("login").strip()
     password = request.forms.get("password")
     password_confirm = request.forms.get("password_confirm")
-    provider = request.forms.get("provider")
     raw_start_night_rate = request.forms.get("start_night_rate")
     raw_end_night_rate = request.forms.get("end_night_rate")
     raw_base_address = request.forms.get("base_address")
     raw_aes_key = request.forms.get("aes_key")
+    raw_nrf_power = request.forms.get("nrf_power")
+    raw_provider = request.forms.get("provider")
 
     ret = {"login": login,
-           "providers": update_providers(False, db),
+           "providers": tools.update_providers(config.get("url_energy_providers"),
+                                               False,
+                                               db),
            "start_night_rate": raw_start_night_rate,
            "end_night_rate": raw_end_night_rate,
            "base_address": raw_base_address,
-           "aes_key": raw_aes_key}
+           "aes_key": raw_aes_key,
+           "nrf_power": raw_nrf_power}
 
     try:
         base_address_int = int(raw_base_address.strip("L"), 16)
-        base_address = str(hex(base_address_int)).upper() + "LL"
     except ValueError:
         error = {"title": "Format invalide",
                  "content": ("L'adresse de la base entrée est invalide.")}
@@ -915,18 +1143,41 @@ def install_post(db):
                              "par des tirets.")}
         ret.update({"err": error})
         return ret
-    (db.query(database.Sensor)
-     .filter_by(name="CitizenWatt")
-     .update({"base_address": base_address, "aes_key": json.dumps(aes_key)}))
-    db.commit()
 
     try:
-        start_night_rate = raw_start_night_rate.split(":")
-        assert(len(start_night_rate) == 2)
-        start_night_rate = [int(i) for i in start_night_rate]
-        assert(start_night_rate[0] >= 0 and start_night_rate[0] <= 23)
-        assert(start_night_rate[1] >= 0 and start_night_rate[1] <= 59)
-        start_night_rate = 3600 * start_night_rate[0] + 60*start_night_rate[1]
+        assert(raw_nrf_power in tools.nrf_power_dict)
+    except AssertionError:
+        error = {"title": "Format invalide",
+                 "content": ("La puissance indiquée pour le nRF est " +
+                             "invalide. ")}
+        ret.update({"err": error})
+        return ret
+    tools.update_nrf_power(raw_nrf_power)
+
+    (db.query(database.Sensor)
+     .filter_by(name="CitizenWatt")
+     .update({"aes_key": json.dumps(aes_key)}))
+    db.commit()
+
+    provider = (db.query(database.Provider)
+                .filter_by(name=raw_provider)
+                .first())
+    if not provider:
+        error = {"title": "Fournisseur d'électricité invalide.",
+                 "content": "Le fournisseur choisi n'existe pas."}
+        ret.update({"err": error})
+        return ret
+
+    try:
+        if tools.is_day_night_rate(db, provider):
+            start_night_rate = 0
+        else:
+            start_night_rate = raw_start_night_rate.split(":")
+            assert(len(start_night_rate) == 2)
+            start_night_rate = [int(i) for i in start_night_rate]
+            assert(start_night_rate[0] >= 0 and start_night_rate[0] <= 23)
+            assert(start_night_rate[1] >= 0 and start_night_rate[1] <= 59)
+            start_night_rate = 3600 * start_night_rate[0] + 60*start_night_rate[1]
     except (AssertionError, ValueError):
         error = {"title": "Format invalide",
                  "content": ("La date de début d'heures creuses " +
@@ -935,12 +1186,15 @@ def install_post(db):
         return ret
 
     try:
-        end_night_rate = raw_end_night_rate.split(":")
-        assert(len(end_night_rate) == 2)
-        end_night_rate = [int(i) for i in end_night_rate]
-        assert(end_night_rate[0] >= 0 and end_night_rate[0] <= 23)
-        assert(end_night_rate[1] >= 0 and end_night_rate[1] <= 59)
-        end_night_rate = 3600 * end_night_rate[0] + 60*end_night_rate[1]
+        if tools.is_day_night_rate(db, provider):
+            end_night_rate = 0
+        else:
+            end_night_rate = raw_end_night_rate.split(":")
+            assert(len(end_night_rate) == 2)
+            end_night_rate = [int(i) for i in end_night_rate]
+            assert(end_night_rate[0] >= 0 and end_night_rate[0] <= 23)
+            assert(end_night_rate[1] >= 0 and end_night_rate[1] <= 59)
+            end_night_rate = 3600 * end_night_rate[0] + 60*end_night_rate[1]
     except (AssertionError, ValueError):
         error = {"title": "Format invalide",
                  "content": ("La date de fin d'heures creuses " +
@@ -958,9 +1212,10 @@ def install_post(db):
                               end_night_rate=end_night_rate)
         db.add(admin)
 
-        provider = (db.query(database.Provider)
-                    .filter_by(name=provider)
-                    .update({"current": 1}))
+        db.query(database.Provider).update({"current": 0})
+        (db.query(database.Provider)
+         .filter_by(name=raw_provider)
+         .update({"current": 1}))
 
         session = session_manager.get_session()
         session['valid'] = True
@@ -977,9 +1232,6 @@ def install_post(db):
 
 
 if __name__ == '__main__':
-    # ===
-    # App
-    # ===
     SimpleTemplate.defaults["get_url"] = app.get_url
     SimpleTemplate.defaults["API_URL"] = app.get_url("index")
     SimpleTemplate.defaults["valid_session"] = lambda: session_manager.get_session()['valid']

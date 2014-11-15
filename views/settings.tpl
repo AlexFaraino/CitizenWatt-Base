@@ -7,6 +7,15 @@
 
                 <article id="user">
                     <form method="post" action="/settings">
+                        % if defined('err'):
+                        <div class="dialog-err">
+                            <h4>{{ err['title'] }}</h4>
+                            <p>
+                                {{ err['content'] }}
+                            </p>
+                        </div>
+                        % end
+
                         <h2>Utilisateur</h2>
 
                         <p class="form-item">
@@ -31,20 +40,26 @@
                             <label for="provider">Fournisseur d'énergie&nbsp;: </label>
                             <select name="provider" id="provider">
                                 % for provider in providers:
-                                    <option value="{{ provider["name"] }}">{{ provider["name"] }}</option>
+                                    % if provider["current"]:
+                                        % need_rate_info = provider["is_day_night_rate"]
+                                    % end
+                                    <option value="{{ provider["name"] }}" {{ 'selected' if provider["current"] else '' }} {{ 'class=need-rate-info' if provider["is_day_night_rate"] else '' }}>{{ provider["name"] }}</option>
                                 % end
                             </select>
                         </p>
 
-                        <p class="form-item">
-                            <label for="start_night_rate">Début des heures creuses&nbsp;: </label>
-                            <input type="time" name="start_night_rate" id="start_night_rate" value="{{ start_night_rate }}" placeholder="hh:mm"/>
-                        </p>
+                        <div id="night-rate-info" style="display:{{ 'block' if need_rate_info else 'none' }}">
+                            <p class="form-item">
+                                <label for="start_night_rate">Début des heures creuses&nbsp;: </label>
+                                <input type="time" name="start_night_rate" id="start_night_rate" value="{{ start_night_rate }}" placeholder="hh:mm"/>
+                            </p>
 
-                        <p class="form-item">
-                            <label for="end_night_rate">Fin des heures creuses&nbsp;: </label>
-                            <input type="time" name="end_night_rate" id="end_night_rate" value="{{ end_night_rate }}" placeholder="hh:mm"/>
-                        </p>
+                            <p class="form-item">
+                                <label for="end_night_rate">Fin des heures creuses&nbsp;: </label>
+                                <input type="time" name="end_night_rate" id="end_night_rate" value="{{ end_night_rate }}" placeholder="hh:mm"/>
+                            </p>
+                        </div>
+
                         <p>
                             <input type="submit" value="Sauvegarder"/>
                         </p>
@@ -66,6 +81,16 @@
                         <p class="form-help">
                             Par exemple <code>1-254-0-145-23-3-4-5-6-6-7-8-0-1-15-64</code>.
                         </p>
+                        <p class="form-item">
+                            <label for="nrf_power">Puissance du nRF&nbsp;: </label>
+                            <select name="nrf_power" id="nrf_power">
+                                <option value="min" {{! 'selected="selected"' if nrf_power is "min" else ''}}>Minimale</option>
+                                <option value="low" {{! 'selected="selected"' if nrf_power is "low" else ''}}>Faible</option>
+                                <option value="med" {{! 'selected="selected"' if nrf_power is "med" else ''}}>Moyenne</option>
+                                <option value="high" {{! 'selected="selected"' if nrf_power is "high" or nrf_power not in ["min", "low", "med"] else ''}}>Haute</option>
+                            </select>
+                        </p>
+
                         <p>
                             <input type="submit" value="Sauvegarder"/>
                         </p>
@@ -101,11 +126,11 @@
                     <p>
                         <a href="{{ get_url('update') }}">Mettre à jour le système</a>
                     </p>
-                    <p class="form-help">
+                    <!--<p class="form-help">
                         La mise à jour est automatique. N'utilisez ce bouton que pour forcer la mise à jour.
-                    </p>
+                    </p>-->
                 </article>
 
             </main>
 
-% include('_end.tpl')
+% include('_end.tpl', scripts=['settings'])
