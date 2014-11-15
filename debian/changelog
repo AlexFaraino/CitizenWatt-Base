@@ -1,0 +1,17 @@
+citizenwatt-visu (0.2-2) wheezy; urgency=low
+
+  * test upgrade
+
+ --  Alexandre Faraino <alex@citizenwatt.paris>  Thu, 13 Nov 2014 21:49:16 +0100
+
+citizenwatt-visu (0.2-1) wheezy; urgency=low
+
+  * Fix apairing
+
+ --  Alexandre Faraino <alex@citizenwatt.paris>  Thu, 13 Nov 2014 19:54:33 +0100
+
+citizenwatt-visu (0.1-1) wheezy; urgency=low
+
+  * Initial release.
+
+ -- Alexandre Faraino <alex@citizenwatt.paris>  Mon, 3 Nov 2014 22:34:04 +0100
